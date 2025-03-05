@@ -13,7 +13,10 @@ import pandas as pd
 import typing as t
 import os
 
-pipeline = Pipeline("Joymart - Grocery Analysis")
+pipeline = Pipeline(
+    "My ETL Pipeline",
+    redis_url="redis://localhost:6379/0"
+)
 
 client = OpenAI(api_key=OPENAI_API_KEY)
 
@@ -127,31 +130,13 @@ def clean_external_data(competitor_df: EDF) -> EDF:
     return competitor_df
 
 
-@pipeline.transform
-@pipeline_error_handler(
-    stage_name="enrich_internal_data_with_web",
-    error_classes=(requests.exceptions.HTTPError, ValueError, KeyError),
-    default_category=PipelineError.EXTERNAL_ERROR,
-)
-@pipeline.depends_on("load_internal_data")
-def enrich_internal_data_with_web(product_data_df: EDF) -> EDF:
-    """
-    Looks up product name and fetches additional information from the web
-    """
-
-    output_df = product_data_df.copy()
-    output_df["web_search_data"] = output_df["product"].apply(SearchSerperAgent.run)
-
-    return output_df
-
-
 @pipeline.aggregate
 @pipeline_error_handler(
     stage_name="merge_data",
     error_classes=(ValueError, RowLevelPipelineError),
     default_category=PipelineError.BAD_RESPONSE,
 )
-@pipeline.depends_on("enrich_internal_data_with_web", "clean_external_data")
+@pipeline.depends_on("load_internal_data", "clean_external_data")
 def merge_data(dfs: t.List[EDF]) -> EDF:
     internal_df, external_df = dfs
     limit_rows = 100
@@ -251,6 +236,45 @@ Products:
         )
         return edf
 
+@pipeline.transform
+@pipeline_error_handler(
+    stage_name="merge_data",
+    error_classes=(requests.exceptions.RequestException, ValueError, KeyError, RowLevelPipelineError),
+    default_category=PipelineError.EXTERNAL_ERROR,
+)
+@pipeline.depends_on("load_internal_data")
+def enrich_internal_data_with_web(product_data_df: EDF) -> EDF:
+    """
+    Looks up product name and fetches additional information from the web
+    """
+    output_df = product_data_df.copy()
+    for idx, row in tqdm(output_df.iterrows(), total=len(output_df), desc="Enriching with Web"):
+        try:
+            res = SearchSerperAgent.run(row["product"])
+            output_df.at[idx, "web_search_data"] = res
+        # TODO: build this into the agent side, but we need to handle how to pass in row_idx to refactor things a bit
+        except requests.exceptions.Timeout as e:
+            raise RowLevelPipelineError(
+                row_idx=idx,
+                category=PipelineError.SERVICE_UNAVAILABLE,
+                description=f"Serper API request timed out. The service may be experiencing high load: {str(e)}",
+                column="web_search_data"
+            )
+        except requests.exceptions.RequestException as e:
+            if "Unauthorized" in str(e) or "403" in str(e):
+                raise RowLevelPipelineError(
+                    row_idx=idx,
+                    category=PipelineError.UNAUTHORIZED,
+                    description=f"Unauthorized access to Serper API. Please check API credentials: {str(e)}",
+                    column="web_search_data"
+                )
+            raise RowLevelPipelineError(
+                row_idx=idx,
+                category=PipelineError.SERVICE_UNAVAILABLE,
+                description=f"Error accessing Serper API: {str(e)}",
+                column="web_search_data"
+            )
+    return output_df
 
 @pipeline.fold
 @pipeline_error_handler(

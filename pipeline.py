@@ -19,6 +19,11 @@ from langchain_openai import OpenAIEmbeddings
 from langchain_community.vectorstores import Chroma
 from langchain.chains.retrieval_qa.base import RetrievalQA
 
+import redis
+import pickle
+import json
+from typing import Optional
+
 
 class ErrorPattern(BaseModel):
     """A pattern in the error rows of a stage."""
@@ -36,6 +41,7 @@ class ETLStage(ABC):
         self.name = name
         self.dependencies: t.List[ETLStage] = []
         self.result = None
+        self.row_dependencies: t.Dict[int, t.List[t.Tuple[str, int]]] = {}  # {output_row_id: [(stage_name, input_row_id)]}
 
     def add_dependency(self, stage: "ETLStage"):
         self.dependencies.append(stage)
@@ -47,12 +53,77 @@ class ETLStage(ABC):
     def has_run(self) -> bool:
         return self.result is not None
 
+    def add_row_dependency(self, output_row_id: int, stage_name: str, input_row_id: int):
+        """Track which input rows contributed to an output row"""
+        if output_row_id not in self.row_dependencies:
+            self.row_dependencies[output_row_id] = []
+        self.row_dependencies[output_row_id].append((stage_name, input_row_id))
+
+    def get_row_dependencies(self, row_id: int) -> t.List[t.Tuple[str, int]]:
+        """Get all dependencies for a specific row"""
+        return self.row_dependencies.get(row_id, [])
+
+    def _track_input_dependencies(self, input_df: EDF, output_row_idx: int):
+        """Track dependencies from an input DataFrame to an output row"""
+        if hasattr(input_df, '_source_stage') and hasattr(input_df, '_source_row_id'):
+            self.add_row_dependency(output_row_idx, input_df._source_stage, input_df._source_row_id)
+
+    def _tag_output_rows(self, df: EDF):
+        """Tag output rows with their source stage and row ID"""
+        for idx, row in df.iterrows():
+            row._source_stage = self.name
+            row._source_row_id = idx
+        return df
+
 
 class Pipeline:
-    def __init__(self, name: str):
+    def __init__(self, name: str, redis_url: Optional[str] = None):
         self.name = name
-        self.stages: t.Dict[str, ETLStage] = {}  # Changed to dict for name lookup
+        self.stages: t.Dict[str, ETLStage] = {}
         self.last_stage: t.Optional[ETLStage] = None
+        
+        # Initialize Redis connection if URL provided
+        self.redis_client = None
+        if redis_url:
+            self.redis_client = redis.from_url(redis_url)
+            
+    def _cache_key(self, stage_name: str, row_id: int) -> str:
+        """Generate a unique cache key for a stage's row"""
+        return f"{self.name}:{stage_name}:{row_id}"
+    
+    def _set_cache(self, stage_name: str, row_id: int, value: pd.Series):
+        """Store a row's data in Redis cache"""
+        if not self.redis_client:
+            return
+            
+        key = self._cache_key(stage_name, row_id)
+        # Serialize the pandas Series to bytes
+        serialized = pickle.dumps(value)
+        self.redis_client.set(key, serialized)
+        
+    def _get_cache(self, stage_name: str, row_id: int) -> Optional[pd.Series]:
+        """Retrieve a row's data from Redis cache"""
+        if not self.redis_client:
+            return None
+            
+        key = self._cache_key(stage_name, row_id)
+        cached = self.redis_client.get(key)
+        if cached:
+            try:
+                return pickle.loads(cached)
+            except (pickle.PickleError, TypeError):
+                return None
+        return None
+        
+    def _clear_stage_cache(self, stage_name: str):
+        """Clear all cached data for a stage"""
+        if not self.redis_client:
+            return
+            
+        pattern = f"{self.name}:{stage_name}:*"
+        keys = self.redis_client.keys(pattern)
+        if keys:
+            self.redis_client.delete(*keys)
 
     def add_stage(self, stage: ETLStage):
         """Add a stage to the pipeline without creating automatic dependencies"""
@@ -128,13 +199,17 @@ class Pipeline:
 
         return wrapper
 
-    def run(self, debug: bool = True) -> t.Dict[str, t.Any]:
-        """Execute the pipeline in dependency order
+    def _track_dependencies(self, stage: ETLStage, input_rows: t.List[pd.Series], output_row_idx: int):
+        """Track which input rows contributed to an output row"""
+        for input_row in input_rows:
+            if hasattr(input_row, '_source_stage') and hasattr(input_row, '_source_row_id'):
+                stage.add_row_dependency(output_row_idx, input_row._source_stage, input_row._source_row_id)
 
-        If debug is True, writes the results of each stage to a separate CSV file, under the `debug` directory.
-        """
+    def run(self, debug: bool = True) -> t.Dict[str, t.Any]:
+        """Execute the pipeline in dependency order with Redis caching"""
         results = {}
         executed = set()
+        changed_rows: t.Dict[str, t.Set[int]] = {}  # {stage_name: {row_ids}}
 
         def execute_stage(stage: ETLStage):
             if stage.name in executed:
@@ -145,34 +220,58 @@ class Pipeline:
                 dep_result = execute_stage(dep)
                 dep_results.append(dep_result)
 
-            if isinstance(stage, ExtractStage):
-                if dep_results:
-                    raise ValueError(f"Extract stage {stage.name} should not have dependencies")
-                stage.result = stage.execute()
-            elif isinstance(stage, TransformStage):
-                if len(dep_results) != 1:
-                    raise ValueError(
-                        f"Transform stage {stage.name} expects exactly one dependency, got {len(dep_results)}"
-                    )
-                stage.result = stage.execute(dep_results[0])
-            elif isinstance(stage, FoldStage):
-                if len(dep_results) != 1:
-                    raise ValueError(
-                        f"Fold stage {stage.name} expects exactly one dependency, got {len(dep_results)}"
-                    )
-                stage.result = stage.execute(dep_results[0])
-            elif isinstance(stage, AggregateStage):
-                stage.result = stage.execute(
-                    dep_results
-                )  # Aggregate can take multiple dependencies
+            if stage.name in changed_rows:
+                affected_rows = changed_rows[stage.name]
+                cached_result = stage.result if stage.has_run else EDF()
+                
+                if isinstance(stage, ExtractStage):
+                    stage.result = stage.execute()
+                elif isinstance(stage, TransformStage):
+                    new_result = stage.execute(dep_results[0])
+                    for idx in affected_rows:
+                        cached_row = self._get_cache(stage.name, idx)
+                        if cached_row is not None:
+                            cached_result.iloc[idx] = cached_row
+                        else:
+                            cached_result.iloc[idx] = new_result.iloc[idx]
+                            self._set_cache(stage.name, idx, new_result.iloc[idx])
+                    stage.result = cached_result
+                elif isinstance(stage, FoldStage):
+                    stage.result = stage.execute(dep_results[0])
+                elif isinstance(stage, AggregateStage):
+                    stage.result = stage.execute(dep_results)
 
+                # Tag rows with their source
+                for idx, row in stage.result.iterrows():
+                    row._source_stage = stage.name
+                    row._source_row_id = idx
+
+            else:
+                if stage.has_run:
+                    return stage.result
+
+                if isinstance(stage, ExtractStage):
+                    stage.result = stage.execute()
+                elif isinstance(stage, TransformStage):
+                    stage.result = stage.execute(dep_results[0])
+                    # Cache each row
+                    for idx, row in stage.result.iterrows():
+                        self._set_cache(stage.name, idx, row)
+                elif isinstance(stage, FoldStage):
+                    stage.result = stage.execute(dep_results[0])
+                elif isinstance(stage, AggregateStage):
+                    stage.result = stage.execute(dep_results)
+
+                for idx, row in stage.result.iterrows():
+                    row._source_stage = stage.name
+                    row._source_row_id = idx
+
+            executed.add(stage.name)
+            results[stage.name] = stage.result
             if debug:
                 if not os.path.exists(f"debug/{self.name}"):
                     os.makedirs(f"debug/{self.name}", exist_ok=True)
                 stage.result.to_csv(f"debug/{self.name}/{stage.name}.csv")
-
-            executed.add(stage.name)
-            results[stage.name] = stage.result
             return stage.result
 
         for stage in self.stages.values():
@@ -278,6 +377,16 @@ Consider both the stage implementations and the actual errors encountered."""
         result = chain.run(query)
         return result
 
+    def clear_cache(self):
+        """Clear all cached data for this pipeline"""
+        if not self.redis_client:
+            return
+            
+        pattern = f"{self.name}:*"
+        keys = self.redis_client.keys(pattern)
+        if keys:
+            self.redis_client.delete(*keys)
+
 
 class ExtractStage(ETLStage):
     def __init__(self, name: str, loader: t.Callable[[], EDF]):
@@ -285,7 +394,8 @@ class ExtractStage(ETLStage):
         self._loader = loader
 
     def execute(self) -> EDF:
-        return self._loader()
+        result = self._loader()
+        return self._tag_output_rows(result)
 
 
 class TransformStage(ETLStage):
@@ -294,7 +404,11 @@ class TransformStage(ETLStage):
         self._transformer = transformer
 
     def execute(self, df: EDF) -> EDF:
-        return self._transformer(df)
+        result = self._transformer(df)
+        # TODO: it should be a 1:1 mapping here.
+        for idx, _ in result.iterrows():
+            self._track_input_dependencies(df, idx)
+        return self._tag_output_rows(result)
 
 
 class FoldStage(ETLStage):
@@ -305,7 +419,12 @@ class FoldStage(ETLStage):
         self._folder = folder
 
     def execute(self, df: EDF) -> EDF:
-        return self._folder(df)
+        result = self._folder(df)
+        # For fold operations, each output row depends on all input rows
+        for idx, _ in result.iterrows():
+            for _, input_row in df.iterrows():
+                self._track_input_dependencies(df, idx)
+        return self._tag_output_rows(result)
 
 
 class AggregateStage(ETLStage):
@@ -316,7 +435,13 @@ class AggregateStage(ETLStage):
         self._aggregator = aggregator
 
     def execute(self, dfs: t.List[EDF]) -> EDF:
-        return self._aggregator(dfs)
+        result = self._aggregator(dfs)
+        # For aggregate operations, each output row depends on all input rows from all DataFrames
+        for idx, _ in result.iterrows():
+            for df in dfs:
+                for _, input_row in df.iterrows():
+                    self._track_input_dependencies(df, idx)
+        return self._tag_output_rows(result)
 
 
 pipeline = Pipeline("My ETL Pipeline")

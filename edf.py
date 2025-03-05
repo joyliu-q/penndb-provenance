@@ -13,7 +13,7 @@ class EDF(pd.DataFrame):
     Global errors (not associated with rows) are stored in _global_errors.
     """
 
-    _metadata = ["_error_prefix", "_global_errors", "openai_client"]
+    _metadata = ["_error_prefix", "_global_errors", "openai_client", "_hash"]
 
     @property
     def _constructor(self):
@@ -36,6 +36,7 @@ class EDF(pd.DataFrame):
         self._error_prefix = getattr(other, "_error_prefix", "_error_")
         self._global_errors = getattr(other, "_global_errors", [])
         self.openai_client = getattr(other, "openai_client", None)
+        self._hash = getattr(other, "_hash", self._calculate_hash())
         return self
 
     def __init__(self, *args, **kwargs):
@@ -44,6 +45,20 @@ class EDF(pd.DataFrame):
         self.openai_client = OpenAI(api_key=OPENAI_API_KEY)
 
         super().__init__(*args, **kwargs)
+        self._hash = self._calculate_hash()
+
+    def _calculate_hash(self) -> str:
+        """Calculate a hash of the DataFrame content"""
+        return pd.util.hash_pandas_object(self).sum()
+
+    def has_changed(self) -> bool:
+        """Check if DataFrame content has changed since last hash calculation"""
+        current_hash = self._calculate_hash()
+        return current_hash != self._hash
+
+    def mark_unchanged(self):
+        """Update hash to current state"""
+        self._hash = self._calculate_hash()
 
     def register_natural_error(self, condition: str) -> "EDF":
         """

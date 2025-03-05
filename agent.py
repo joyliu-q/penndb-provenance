@@ -2,6 +2,7 @@ import typing as t
 from error import PipelineError
 from pipeline import Pipeline, RowLevelPipelineError, pipeline_error_handler
 from crewai_tools import CodeDocsSearchTool, SerperDevTool, ScrapeWebsiteTool
+import requests
 
 
 class Agent:

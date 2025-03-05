@@ -10,6 +10,12 @@ This project is divided into the following sections:
     - `grocery.py` is a simple pipeline that loads data, cleans it, and merges it with web search results, as well as detecting errors for a self healing pipeline
 
 ## Installation
+Start Redis server to cahce intermediate result
+```bash
+brew install redis
+redis-server
+```
+
 After setting up the project as with an average `uv` project, run example pipeline:
 ```bash
 cd examples/data && uv run kaggle datasets download -d polartech/walmart-grocery-product-dataset && unzip walmart-grocery-product-dataset.zip
